@@ -85,7 +85,8 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          three: ['three', '@react-three/fiber', '@react-three/drei'],
+          three: ['three'],
+          r3f: ['@react-three/fiber', '@react-three/drei'],
         },
       },
     },

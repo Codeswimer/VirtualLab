@@ -1,15 +1,11 @@
-import { useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
-import {
-  Physics,
-  RigidBody,
-  useSphericalJoint,
-  type RapierRigidBody,
-} from '@react-three/rapier';
 import * as THREE from 'three';
-import { pendulumReleaseGeometry, type Vec3 } from './pendulum-geometry';
+import { periodFiniteAmplitude } from '@sim/physics/pendulum';
+import { pendulumBobPosition, type Vec3 } from './pendulum-geometry';
 
 const UP = new THREE.Vector3(0, 1, 0);
+const DEG_TO_RAD = Math.PI / 180;
 
 export interface PendulumApparatusProps {
   /** World position of the point of suspension. */
@@ -18,18 +14,18 @@ export interface PendulumApparatusProps {
   lengthM: number;
   /** Release angle from the vertical, in degrees. Keep below 10° for SHM. */
   amplitudeDeg: number;
-  /** Free-fall acceleration used by the rigid-body world, m/s². */
+  /** Free-fall acceleration used to derive the period, m/s². */
   g: number;
-  /** Changing this remounts the world, releasing the bob again. */
+  /** Changing this releases the bob again. */
   releaseKey?: number;
 }
 
 /**
- * Rigid-body simple pendulum (PHY-01).
+ * Simple pendulum (PHY-01).
  *
- * Rapier drives what the student sees; the timings recorded in the table come
- * from the analytic solver (ADR-002), so the table never depends on frame rate
- * or on how long the scene has been open.
+ * The swing is animated from θ(t) = θ₀ cos(2πt / T), using the same
+ * finite-amplitude period the stopwatch readout is built on (ADR-002), so the
+ * scene stays in step with the recorded times and never depends on frame rate.
  */
 export function PendulumApparatus({
   pivot,
@@ -38,79 +34,59 @@ export function PendulumApparatus({
   g,
   releaseKey = 0,
 }: PendulumApparatusProps) {
-  return (
-    <Physics
-      key={`${lengthM}-${amplitudeDeg}-${releaseKey}`}
-      gravity={[0, -g, 0]}
-      timeStep={1 / 120}
-    >
-      <PendulumBodies pivot={pivot} lengthM={lengthM} amplitudeDeg={amplitudeDeg} />
-    </Physics>
-  );
-}
-
-function PendulumBodies({
-  pivot,
-  lengthM,
-  amplitudeDeg,
-}: Pick<PendulumApparatusProps, 'pivot' | 'lengthM' | 'amplitudeDeg'>) {
-  const anchorRef = useRef<RapierRigidBody>(null);
-  const bobRef = useRef<RapierRigidBody>(null);
   const threadRef = useRef<THREE.Mesh>(null);
+  const bobRef = useRef<THREE.Group>(null);
+  const startedAt = useRef(0);
 
-  const { bobPosition, pivotInBobFrame } = useMemo(
-    () => pendulumReleaseGeometry(pivot, lengthM, amplitudeDeg),
-    [pivot, lengthM, amplitudeDeg],
-  );
+  const theta0 = amplitudeDeg * DEG_TO_RAD;
+  const period = periodFiniteAmplitude(lengthM, amplitudeDeg, g);
+  const bobRadius = Math.max(0.055, Math.min(0.11, lengthM * 0.09));
 
-  useSphericalJoint(anchorRef, bobRef, [[0, 0, 0], pivotInBobFrame]);
+  // Release the bob from the start angle again on mount, length change or re-release.
+  useEffect(() => {
+    startedAt.current = performance.now();
+  }, [releaseKey, lengthM, amplitudeDeg]);
 
-  const scratch = useMemo(
-    () => ({ direction: new THREE.Vector3(), mid: new THREE.Vector3() }),
-    [],
-  );
+  const scratch = useMemo(() => ({ direction: new THREE.Vector3() }), []);
 
   useFrame(() => {
-    const body = bobRef.current;
+    const bob = bobRef.current;
     const thread = threadRef.current;
-    if (!body || !thread) return;
-    const { x, y, z } = body.translation();
-    const { direction, mid } = scratch;
-    direction.set(x - pivot[0], y - pivot[1], z - pivot[2]);
-    const span = direction.length() || lengthM;
-    mid.set(pivot[0], pivot[1], pivot[2]).addScaledVector(direction, 0.5);
-    thread.position.copy(mid);
-    thread.quaternion.setFromUnitVectors(UP, direction.normalize());
-    thread.scale.y = span;
-  });
+    if (!bob || !thread) return;
+    if (!startedAt.current) startedAt.current = performance.now();
+    const elapsed = (performance.now() - startedAt.current) / 1000;
+    const theta = theta0 * Math.cos((2 * Math.PI * elapsed) / period);
+    const [bobX, bobY, bobZ] = pendulumBobPosition(pivot, lengthM, theta);
+    bob.position.set(bobX, bobY, bobZ);
 
-  const bobRadius = Math.max(0.055, Math.min(0.11, lengthM * 0.09));
+    const [pivotX, pivotY, pivotZ] = pivot;
+    const { direction } = scratch;
+    direction.set(bobX - pivotX, bobY - pivotY, bobZ - pivotZ);
+    thread.position.set(
+      pivotX + direction.x / 2,
+      pivotY + direction.y / 2,
+      pivotZ + direction.z / 2,
+    );
+    thread.quaternion.setFromUnitVectors(UP, direction.normalize());
+    thread.scale.y = lengthM;
+  });
 
   return (
     <>
       {/* Fixed suspension point */}
-      <RigidBody ref={anchorRef} type="fixed" position={pivot}>
-        <mesh>
-          <sphereGeometry args={[0.022, 24, 24]} />
-          <meshStandardMaterial color="#1f2937" metalness={0.7} roughness={0.3} />
-        </mesh>
-      </RigidBody>
+      <mesh position={pivot}>
+        <sphereGeometry args={[0.022, 24, 24]} />
+        <meshStandardMaterial color="#1f2937" metalness={0.7} roughness={0.3} />
+      </mesh>
 
-      {/* Thread: drawn from the live bob translation so it always runs pivot → bob */}
+      {/* Thread: runs pivot → bob every frame */}
       <mesh ref={threadRef} castShadow>
         <cylinderGeometry args={[0.0035, 0.0035, 1, 8]} />
         <meshStandardMaterial color="#e7e5e4" roughness={0.8} />
       </mesh>
 
-      {/* Swinging bob, joined to the pivot at distance L */}
-      <RigidBody
-        ref={bobRef}
-        position={bobPosition}
-        colliders="ball"
-        mass={0.05}
-        linearDamping={0}
-        angularDamping={0.4}
-      >
+      {/* Bob, held one length from the pivot */}
+      <group ref={bobRef}>
         <mesh castShadow>
           <sphereGeometry args={[bobRadius, 32, 32]} />
           <meshStandardMaterial color="#d4a017" metalness={0.9} roughness={0.18} />
@@ -125,7 +101,7 @@ function PendulumBodies({
             opacity={0.12}
           />
         </mesh>
-      </RigidBody>
+      </group>
     </>
   );
 }

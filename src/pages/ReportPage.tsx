@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Calculator,
   CheckCircle2,
+  ClipboardCheck,
   CloudOff,
   FileText,
   LineChart,
@@ -14,12 +15,14 @@ import {
   XCircle,
 } from 'lucide-react';
 import { getExperimentByCode } from '@/experiments';
+import { scenarioFor } from '@/experiments';
 import { drawnLineGradient } from '@sim/math';
 import { parseNumberAnswer } from '@sim/math';
 import type { CriterionKind } from '@sim/scoring/types';
 import { attemptGrade, attemptPercent, useAppStore } from '@/stores/app-store';
 import { useCurrentUser } from '@/hooks/use-app';
 import { Badge, ProgressBar, ScoreRing } from '@/components/ui/primitives';
+import { ChallengePanel } from '@/components/lab/ChallengePanel';
 import { cn, formatDateTime } from '@/lib/utils';
 
 const kindLabels: Record<CriterionKind, string> = {
@@ -42,6 +45,7 @@ export function ReportPage() {
   const { attemptId } = useParams();
   const navigate = useNavigate();
   const attempts = useAppStore((state) => state.attempts);
+  const assignments = useAppStore((state) => state.assignments);
   const startAttempt = useAppStore((state) => state.startAttempt);
   const user = useCurrentUser();
   const attempt = attempts.find((candidate) => candidate.id === attemptId);
@@ -65,10 +69,11 @@ export function ReportPage() {
   const score = attempt.score;
   const displayPercent = attemptPercent(attempt) ?? score.percent;
   const displayGrade = attemptGrade(attempt) ?? score.grade;
-  const scenario = experiment.generate(attempt.seed);
+  const scenario = scenarioFor(experiment, attempt.seed, attempt.params);
   const kinds = Array.from(new Set(score.criteria.map((c) => c.kind)));
   const gradient = attempt.graph?.line ? drawnLineGradient(attempt.graph.line) : null;
   const ownAttempt = attempt.studentId === user?.id;
+  const assignment = assignments.find((entry) => entry.id === attempt.assignmentId);
 
   const sectionTotals = kinds.map((kind) => {
     const items = score.criteria.filter((criterion) => criterion.kind === kind);
@@ -355,6 +360,23 @@ export function ReportPage() {
               {attempt.notes.trim() || 'No conclusion was written.'}
             </p>
           </section>
+
+          {assignment && assignment.questions.length > 0 ? (
+            <section className="card p-5">
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-ink-900">
+                <ClipboardCheck className="h-4 w-4 text-amber-700" /> Test: {assignment.title}
+              </h2>
+              <p className="mt-0.5 text-[10.5px] text-ink-400">
+                Written answers are marked by {assignment.teacherName}.
+              </p>
+              <div className="mt-3">
+                <ChallengePanel
+                  questions={assignment.questions}
+                  answers={attempt.challenge}
+                />
+              </div>
+            </section>
+          ) : null}
         </div>
       </div>
 

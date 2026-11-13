@@ -5,8 +5,10 @@ import { opticsExperiments } from './physics-optics';
 import { electricityExperiments } from './physics-electricity';
 import { thermalExperiments } from './physics-thermal';
 import { chemistryExperiments } from './chemistry';
+import { scenarioFor } from './parameters';
 
 export * from './types';
+export * from './parameters';
 
 export const EXPERIMENTS: ExperimentDefinition<any>[] = [
   ...mechanicsExperiments,
@@ -81,7 +83,7 @@ export function gradeAttempt(
   experiment: ExperimentDefinition<any>,
   attempt: AttemptData,
 ): ReturnType<ExperimentDefinition['score']> {
-  const scenario = experiment.generate(attempt.seed);
+  const scenario = scenarioFor(experiment, attempt.seed, attempt.params);
   return experiment.score(attempt, scenario);
 }
 

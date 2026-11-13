@@ -3,7 +3,9 @@ import {
   ArrowRight,
   Award,
   BookOpenCheck,
+  CalendarClock,
   ChevronRight,
+  ClipboardCheck,
   GraduationCap,
   Medal,
   Play,
@@ -62,11 +64,24 @@ function greeting(): string {
   return 'Good evening';
 }
 
+/** Deadlines are in the future, so relativeTime() would read "just now". */
+function dueLabel(iso: string): string {
+  const diff = new Date(iso).getTime() - Date.now();
+  if (diff <= 0) return `was due ${relativeTime(iso)}`;
+  const minutes = Math.ceil(diff / 60000);
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `in ${hours} hr`;
+  const days = Math.ceil(hours / 24);
+  return `in ${days} day${days === 1 ? '' : 's'}`;
+}
+
 export function StudentDashboard() {
   const user = useCurrentUser();
   const attempts = useAppStore((state) => state.attempts);
   const leaderboard = useAppStore((state) => state.leaderboard);
   const schools = useAppStore((state) => state.schools);
+  const assignments = useAppStore((state) => state.assignments);
   const classCode = user?.classCode ?? '';
 
   if (!user) return null;
@@ -82,6 +97,13 @@ export function StudentDashboard() {
   const recent = attemptsForStudent(attempts, user.id).slice(0, 5);
   const drafts = attempts.filter(
     (attempt) => attempt.studentId === user.id && attempt.status === 'IN_PROGRESS',
+  );
+  const classTests = assignments.filter(
+    (assignment) =>
+      assignment.classCode === classCode && assignment.schoolId === user.schoolId,
+  );
+  const testAttempts = attempts.filter(
+    (attempt) => attempt.studentId === user.id && attempt.assignmentId,
   );
 
   const focus = EXPERIMENTS.map((experiment) => ({
@@ -212,6 +234,99 @@ export function StudentDashboard() {
           tone="ink"
         />
       </div>
+
+      {classTests.length > 0 ? (
+        <section className="mt-6">
+          <SectionHeading
+            title="Assigned tests"
+            subtitle={
+              classTests.filter(
+                (assignment) =>
+                  !testAttempts.some(
+                    (attempt) =>
+                      attempt.assignmentId === assignment.id && attempt.status === 'SCORED',
+                  ),
+              ).length > 0
+                ? 'Your teacher has set work for this class. Open a test to run the practical and answer the written questions.'
+                : 'Every test set for this class has been submitted.'
+            }
+          />
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {classTests.map((assignment) => {
+              const experiment = getExperimentByCode(assignment.experimentCode);
+              if (!experiment) return null;
+              const attempt = testAttempts.find(
+                (candidate) => candidate.assignmentId === assignment.id,
+              );
+              const overdue =
+                assignment.dueAt &&
+                new Date(assignment.dueAt).getTime() < Date.now() &&
+                attempt?.status !== 'SCORED';
+              return (
+                <div key={assignment.id} className="card flex flex-col p-4">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge tone={assignment.source === 'AI' ? 'jade' : 'amber'}>
+                      {assignment.source === 'AI' ? (
+                        <>
+                          <Sparkles className="h-3 w-3" /> AI challenge
+                        </>
+                      ) : (
+                        <>
+                          <ClipboardCheck className="h-3 w-3" /> Class test
+                        </>
+                      )}
+                    </Badge>
+                    {attempt?.status === 'SCORED' ? (
+                      <Badge tone="jade">Submitted</Badge>
+                    ) : attempt?.status === 'IN_PROGRESS' || attempt?.status === 'SUBMITTED' ? (
+                      <Badge tone="amber">In progress</Badge>
+                    ) : overdue ? (
+                      <Badge tone="red">Overdue</Badge>
+                    ) : (
+                      <Badge tone="neutral">To do</Badge>
+                    )}
+                    {assignment.questions.length > 0 ? (
+                      <Badge tone="sky">{assignment.questions.length} questions</Badge>
+                    ) : null}
+                  </div>
+                  <p className="mt-2 text-[13px] font-semibold leading-snug text-ink-800">
+                    {assignment.title}
+                  </p>
+                  <p className="mt-0.5 text-[10.5px] text-ink-400">
+                    {experiment.meta.title} · set by {assignment.teacherName}
+                  </p>
+                  {assignment.instructions ? (
+                    <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-ink-500">
+                      {assignment.instructions}
+                    </p>
+                  ) : null}
+                  <div className="mt-auto flex items-center justify-between gap-2 pt-3">
+                    <span className="inline-flex items-center gap-1 text-[10px] text-ink-400">
+                      <CalendarClock className="h-3 w-3" />
+                      {assignment.dueAt ? dueLabel(assignment.dueAt) : 'No due date'}
+                    </span>
+                    <Link
+                      to={
+                        attempt?.status === 'SCORED'
+                          ? `/report/${attempt.id}`
+                          : `/lab/${experiment.meta.slug}?assignment=${assignment.id}`
+                      }
+                      className="btn-primary btn-sm"
+                    >
+                      {attempt?.status === 'SCORED'
+                        ? 'Review work'
+                        : attempt?.status === 'IN_PROGRESS'
+                          ? 'Continue'
+                          : 'Open test'}
+                      <ArrowRight className="h-3 w-3" />
+                    </Link>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
 
       {drafts.length > 0 ? (
         <div className="mt-4 flex flex-wrap gap-2">

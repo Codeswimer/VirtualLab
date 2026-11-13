@@ -3,12 +3,14 @@ import { persist } from 'zustand/middleware';
 import type { AttemptData, AttemptRow, GraphAnswer, ScoreResult } from '@sim/scoring/types';
 import { gradeFor } from '@sim/scoring/types';
 import { randomSeed } from '@sim/rng';
-import { getExperimentByCode } from '@/experiments';
+import { getExperimentByCode, scenarioFor } from '@/experiments';
 import { markAttempt } from '@/services/scoring-service';
 import {
   clearReview as apiClearReview,
   clearToken,
+  createAssignment as apiCreateAssignment,
   createMember as apiCreateMember,
+  deleteAssignment as apiDeleteAssignment,
   discardAttempt as apiDiscardAttempt,
   errorMessage,
   login as apiLogin,
@@ -75,6 +77,37 @@ export interface StoredAttempt extends AttemptData {
   score?: ScoreResult;
   review?: AttemptReview;
   scenarioSnapshot?: unknown;
+  /** Set when this attempt answers a test published by a teacher. */
+  assignmentId?: string;
+  /** Written answers to an AI-authored challenge. */
+  challenge?: Record<string, string>;
+}
+
+export interface AssignmentQuestion {
+  id: string;
+  prompt: string;
+  marks: number;
+  /** Hidden from students; shown while the teacher marks. */
+  markingGuide?: string;
+}
+
+/** A test a teacher has published to their class. */
+export interface Assignment {
+  id: string;
+  teacherId: string;
+  teacherName: string;
+  schoolId: string;
+  classCode: string;
+  title: string;
+  experimentCode: string;
+  instructions: string;
+  dueAt?: string;
+  /** Bench parameters the test fixes for every student. */
+  params: Record<string, number>;
+  questions: AssignmentQuestion[];
+  markingGuide: string;
+  source: 'TEACHER' | 'AI';
+  createdAt: string;
 }
 
 /** Server-computed ranking row, sanitised for every signed-in role. */
@@ -127,6 +160,18 @@ interface CreateMemberInput {
   gradeLevel: string;
 }
 
+export interface CreateAssignmentInput {
+  title: string;
+  experimentCode: string;
+  classCode?: string;
+  instructions?: string;
+  dueAt?: string | null;
+  params?: Record<string, number>;
+  questions?: AssignmentQuestion[];
+  markingGuide?: string;
+  source?: 'TEACHER' | 'AI';
+}
+
 export interface ActionResult {
   error?: string;
   ok?: boolean;
@@ -138,6 +183,7 @@ interface AppState {
   schools: School[];
   accounts: Account[];
   leaderboard: LeaderboardRow[];
+  assignments: Assignment[];
   currentUserId: string | null;
   attempts: StoredAttempt[];
   lastSyncedAt: string | null;
@@ -154,7 +200,12 @@ interface AppState {
   setMemberStatus: (memberId: string, status: AccountStatus) => Promise<string | null>;
   reviewAttempt: (attemptId: string, marks: number, comment: string) => Promise<string | null>;
   clearReview: (attemptId: string) => Promise<string | null>;
-  startAttempt: (experimentCode: string) => string | null;
+  createAssignment: (input: CreateAssignmentInput) => Promise<ActionResult>;
+  deleteAssignment: (assignmentId: string) => Promise<string | null>;
+  startAttempt: (
+    experimentCode: string,
+    options?: { assignmentId?: string; params?: Record<string, number>; seed?: number },
+  ) => string | null;
   updateAttempt: (
     id: string,
     patch: Partial<Omit<StoredAttempt, 'id' | 'studentId' | 'experimentCode'>>,
@@ -214,10 +265,14 @@ function scheduleDraftSave(id: string): void {
   draftTimers.set(id, timer);
 }
 
-export function initialRowsFor(experimentCode: string, seed: number): AttemptRow[] {
+export function initialRowsFor(
+  experimentCode: string,
+  seed: number,
+  params?: Record<string, number>,
+): AttemptRow[] {
   const experiment = getExperimentByCode(experimentCode);
   if (!experiment) return [];
-  const scenario = experiment.generate(seed);
+  const scenario = scenarioFor(experiment, seed, params);
   const presets = experiment.table.presets?.(scenario);
   if (presets && presets.length > 0) {
     return presets.map((row) => ({ ...row }));
@@ -232,6 +287,7 @@ export const useAppStore = create<AppState>()(
       schools: [],
       accounts: [],
       leaderboard: [],
+      assignments: [],
       currentUserId: null,
       attempts: [],
       lastSyncedAt: null,
@@ -253,6 +309,7 @@ export const useAppStore = create<AppState>()(
             schools: data.schools,
             accounts: data.accounts,
             leaderboard: data.leaderboard,
+            assignments: data.assignments,
             currentUserId: data.user.id,
             attempts: mergeAttempts(data.attempts, localAttempts, data.user.id),
             lastSyncedAt: data.serverTime,
@@ -268,6 +325,7 @@ export const useAppStore = create<AppState>()(
               currentUserId: null,
               schools: [],
               accounts: [],
+              assignments: [],
               attempts: [],
               leaderboard: [],
               hydrated: true,
@@ -329,6 +387,7 @@ export const useAppStore = create<AppState>()(
           currentUserId: null,
           schools: [],
           accounts: [],
+          assignments: [],
           attempts: [],
           leaderboard: [],
           lastSyncedAt: null,
@@ -398,24 +457,50 @@ export const useAppStore = create<AppState>()(
         }
       },
 
-      startAttempt: (experimentCode) => {
+      createAssignment: async (input) => {
+        try {
+          await apiCreateAssignment(input);
+          await get().refresh();
+          return { ok: true };
+        } catch (error) {
+          return { error: errorMessage(error) };
+        }
+      },
+
+      deleteAssignment: async (assignmentId) => {
+        try {
+          await apiDeleteAssignment(assignmentId);
+          await get().refresh();
+          return null;
+        } catch (error) {
+          return errorMessage(error);
+        }
+      },
+
+      startAttempt: (experimentCode, options) => {
         const experiment = getExperimentByCode(experimentCode);
         const studentId = get().currentUserId;
         const actor = get().accounts.find((account) => account.id === studentId);
         if (!experiment || !studentId || actor?.role !== 'STUDENT') return null;
-        const seed = randomSeed();
+        const seed = options?.seed ?? randomSeed();
+        const params = options?.params && Object.keys(options.params).length > 0
+          ? options.params
+          : undefined;
         const attempt: StoredAttempt = {
           id: makeId('attempt'),
           studentId,
           experimentCode,
           seed,
+          params,
+          assignmentId: options?.assignmentId,
           status: 'IN_PROGRESS',
           delivery: 'not-submitted',
           configVersion: CONFIG_VERSION,
           idempotencyKey: makeId('idem'),
           startedAt: now(),
-          rows: initialRowsFor(experimentCode, seed),
+          rows: initialRowsFor(experimentCode, seed, params),
           answers: {},
+          challenge: options?.assignmentId ? {} : undefined,
           notes: '',
           graph: null,
           flags: {},
@@ -547,6 +632,7 @@ export const useAppStore = create<AppState>()(
         leaderboard: state.leaderboard,
         currentUserId: state.currentUserId,
         attempts: state.attempts,
+        assignments: state.assignments,
         lastSyncedAt: state.lastSyncedAt,
       }),
     },

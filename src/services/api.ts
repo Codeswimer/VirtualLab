@@ -1,6 +1,8 @@
 import type {
   Account,
   AccountStatus,
+  Assignment,
+  CreateAssignmentInput,
   LeaderboardRow,
   School,
   SchoolStatus,
@@ -89,6 +91,7 @@ export interface BootstrapPayload {
   schools: School[];
   accounts: Account[];
   attempts: StoredAttempt[];
+  assignments: Assignment[];
   leaderboard: LeaderboardRow[];
   serverTime: string;
 }
@@ -194,6 +197,9 @@ function attemptBody(attempt: StoredAttempt) {
     graph: attempt.graph,
     flags: attempt.flags,
     notes: attempt.notes,
+    params: attempt.params ?? {},
+    assignmentId: attempt.assignmentId ?? null,
+    challenge: attempt.challenge ?? {},
   };
 }
 
@@ -239,6 +245,51 @@ export function clearReview(attemptId: string): Promise<{ attempt: StoredAttempt
   return request(`/api/attempts/${encodeURIComponent(attemptId)}/review`, {
     method: 'DELETE',
   });
+}
+
+export function createAssignment(
+  input: CreateAssignmentInput,
+): Promise<{ assignment: Assignment }> {
+  return request('/api/assignments', { method: 'POST', body: input });
+}
+
+export function deleteAssignment(assignmentId: string): Promise<{ ok: boolean }> {
+  return request(`/api/assignments/${encodeURIComponent(assignmentId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export interface AiChallengeQuestion {
+  prompt: string;
+  marks: number;
+  markingGuide: string;
+}
+
+export interface AiChallenge {
+  title: string;
+  waecReference: string;
+  objective: string;
+  instructions: string;
+  questions: AiChallengeQuestion[];
+  markingGuide: string;
+}
+
+export interface AiChallengeInput {
+  subject: 'PHYSICS' | 'CHEMISTRY';
+  gradeLevel: string;
+  difficulty: 'foundation' | 'standard' | 'extension';
+  experimentCode?: string;
+  experimentTitle?: string;
+  curriculum?: string;
+  skills?: string[];
+  count?: number;
+  focus?: string;
+}
+
+export function generateChallenge(
+  input: AiChallengeInput,
+): Promise<{ challenge: AiChallenge; model: string }> {
+  return request('/api/ai/challenge', { method: 'POST', body: input });
 }
 
 export function errorMessage(error: unknown): string {

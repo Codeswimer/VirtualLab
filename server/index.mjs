@@ -7,6 +7,16 @@ import { createApiHandler } from './app.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const distDir = path.join(root, 'dist');
+
+// Optional local .env for secrets such as GEMINI_API_KEY. The file is gitignored.
+const envPath = path.join(root, '.env');
+if (fs.existsSync(envPath)) {
+  try {
+    process.loadEnvFile(envPath);
+  } catch (error) {
+    console.error('[vlab] Could not read .env:', error.message);
+  }
+}
 const dataDir = process.env.DATA_DIR ?? path.join(root, 'server', 'data');
 const databasePath = process.env.DB_PATH ?? path.join(dataDir, 'vlab.db');
 const port = Number(process.env.PORT ?? 4000);

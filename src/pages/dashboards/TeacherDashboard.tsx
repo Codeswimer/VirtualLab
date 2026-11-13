@@ -28,6 +28,8 @@ import {
   Tabs,
 } from '@/components/ui/primitives';
 import { GradePill, PageHeading, StatCard } from '@/components/dashboard/kit';
+import { ChallengePanel } from '@/components/lab/ChallengePanel';
+import { TeacherTestsPanel } from './TeacherTestsPanel';
 
 export function TeacherDashboard() {
   const user = useCurrentUser();
@@ -36,6 +38,8 @@ export function TeacherDashboard() {
   const reviewAttempt = useAppStore((state) => state.reviewAttempt);
   const clearReview = useAppStore((state) => state.clearReview);
   const [subject, setSubject] = useState<Subject | 'ALL'>('ALL');
+  const [view, setView] = useState<'marking' | 'tests'>('marking');
+  const assignments = useAppStore((state) => state.assignments);
   const [markingId, setMarkingId] = useState<string | null>(null);
   const [marks, setMarks] = useState('');
   const [comment, setComment] = useState('');
@@ -108,6 +112,9 @@ export function TeacherDashboard() {
   const activeStudent = accounts.find((account) => account.id === active?.studentId);
   const activeExperiment = EXPERIMENTS.find(
     (experiment) => experiment.meta.code === active?.experimentCode,
+  );
+  const activeAssignment = assignments.find(
+    (assignment) => assignment.id === active?.assignmentId,
   );
 
   const openMarking = (attempt: StoredAttempt) => {
@@ -214,6 +221,19 @@ export function TeacherDashboard() {
         }
       />
 
+      <div className="mt-4">
+        <Tabs
+          tabs={[
+            { id: 'marking', label: 'Marking & progress' },
+            { id: 'tests', label: 'Tests & AI challenges' },
+          ]}
+          value={view}
+          onChange={(id) => setView(id as 'marking' | 'tests')}
+        />
+      </div>
+
+      {view === 'marking' ? (
+        <>
       <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <StatCard label="Students" value={String(students.length)} hint="active in this class" icon={Users} />
         <StatCard label="Participating" value={`${participating}/${students.length}`} hint="with submissions" icon={GraduationCap} tone="amber" />
@@ -464,6 +484,10 @@ export function TeacherDashboard() {
           </div>
         </div>
       )}
+        </>
+      ) : (
+        <TeacherTestsPanel />
+      )}
 
       <Modal
         open={Boolean(active)}
@@ -516,6 +540,23 @@ export function TeacherDashboard() {
                 below — it becomes the mark on the report and leaderboard.
               </p>
             </div>
+
+            {activeAssignment && activeAssignment.questions.length > 0 ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-3">
+                <ChallengePanel
+                  questions={activeAssignment.questions}
+                  answers={active.challenge}
+                  readOnly
+                  showGuides
+                />
+                {activeAssignment.markingGuide ? (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-white/80 px-2.5 py-2 text-[11px] leading-relaxed text-amber-900">
+                    <span className="font-semibold">General marking guide: </span>
+                    {activeAssignment.markingGuide}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
 
             <div>
               <label className="label" htmlFor="teacher-marks">

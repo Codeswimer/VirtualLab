@@ -44,6 +44,8 @@ export interface AttemptData {
   flags: Record<string, boolean>;
   /** Free-text conclusion or observation notes. */
   notes: string;
+  /** Manual bench parameters chosen before taking readings. */
+  params?: Record<string, number>;
   startedAt?: string;
   submittedAt?: string;
 }

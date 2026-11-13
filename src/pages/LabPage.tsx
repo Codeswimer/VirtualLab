@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft,
   BookOpen,
   Calculator,
   Check,
   ChevronRight,
+  ClipboardCheck,
   Clock,
   FlaskConical,
   HelpCircle,
@@ -20,7 +21,7 @@ import {
   Timer,
   Trophy,
 } from 'lucide-react';
-import { getExperiment } from '@/experiments';
+import { getExperiment, parametersFor, scenarioFor } from '@/experiments';
 import { PRIORITY_LABELS, SUBJECT_LABELS } from '@/experiments';
 import type { GraphAnswer } from '@sim/scoring/types';
 import { drawnLineGradient } from '@sim/math';
@@ -32,6 +33,8 @@ import { GraphTool } from '@/components/lab/GraphTool';
 import { CalculationSheet } from '@/components/lab/CalculationSheet';
 import { NotesPanel } from '@/components/lab/NotesPanel';
 import { ProcedurePanel } from '@/components/lab/ProcedurePanel';
+import { ParameterPanel } from '@/components/lab/ParameterPanel';
+import { ChallengePanel } from '@/components/lab/ChallengePanel';
 import { SubmitDialog } from '@/components/lab/SubmitDialog';
 import { SceneRenderer } from '@/components/scenes/SceneRenderer';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
@@ -56,11 +59,15 @@ function useElapsed(startedAt: string | undefined): string {
 export function LabPage() {
   const { slug } = useParams();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const user = useCurrentUser();
   const online = useOnlineStatus();
   const experiment = slug ? getExperiment(slug) : undefined;
+  const assignmentId = searchParams.get('assignment');
 
   const attempts = useAppStore((state) => state.attempts);
+  const assignments = useAppStore((state) => state.assignments);
+  const assignment = assignments.find((entry) => entry.id === assignmentId);
   const startAttempt = useAppStore((state) => state.startAttempt);
   const updateAttempt = useAppStore((state) => state.updateAttempt);
   const addRow = useAppStore((state) => state.addRow);
@@ -77,7 +84,10 @@ export function LabPage() {
 
   const studentAttempts = attempts.filter((attempt) => attempt.studentId === user?.id);
   const draft = studentAttempts.find(
-    (attempt) => attempt.status === 'IN_PROGRESS' && attempt.experimentCode === experiment?.meta.code,
+    (attempt) =>
+      attempt.status === 'IN_PROGRESS' &&
+      attempt.experimentCode === experiment?.meta.code &&
+      (assignmentId ? attempt.assignmentId === assignmentId : !attempt.assignmentId),
   );
   const scored = studentAttempts
     .filter((attempt) => attempt.status === 'SCORED' && attempt.experimentCode === experiment?.meta.code)
@@ -97,19 +107,27 @@ export function LabPage() {
   }, [toast]);
 
   const scenario = useMemo(
-    () => (experiment && draft ? experiment.generate(draft.seed) : null),
-    [experiment, draft?.seed],
+    () => (experiment && draft ? scenarioFor(experiment, draft.seed, draft.params) : null),
+    [experiment, draft?.seed, draft?.params],
   );
+
+  const paramsLocked = Boolean(assignment && Object.keys(assignment.params ?? {}).length > 0);
 
   const handleStart = useCallback(() => {
     if (!experiment) return;
     const existing = studentAttempts.find(
-      (attempt) => attempt.status === 'IN_PROGRESS' && attempt.experimentCode === experiment.meta.code,
+      (attempt) =>
+        attempt.status === 'IN_PROGRESS' &&
+        attempt.experimentCode === experiment.meta.code &&
+        (assignmentId ? attempt.assignmentId === assignmentId : !attempt.assignmentId),
     );
     if (existing) return;
-    const id = startAttempt(experiment.meta.code);
+    const id = startAttempt(
+      experiment.meta.code,
+      assignment ? { assignmentId: assignment.id, params: assignment.params } : undefined,
+    );
     if (id) setStepsDone(new Set());
-  }, [experiment, startAttempt, studentAttempts]);
+  }, [experiment, startAttempt, studentAttempts, assignment, assignmentId]);
 
   const onGraphChange = useCallback(
     (patch: Partial<GraphAnswer>) => {
@@ -160,6 +178,7 @@ export function LabPage() {
       <Briefing
         experiment={experiment}
         best={best}
+        assignment={assignment}
         onStart={handleStart}
         onReport={() => best && navigate(`/report/${best.id}`)}
       />
@@ -201,6 +220,16 @@ export function LabPage() {
             label: 'Calculations',
             icon: <Calculator className="h-3.5 w-3.5" />,
             badge: Object.values(draft.answers).filter((answer) => answer.trim() !== '').length,
+          },
+        ]
+      : []),
+    ...(assignment && assignment.questions.length > 0
+      ? [
+          {
+            id: 'test',
+            label: 'Test',
+            icon: <ClipboardCheck className="h-3.5 w-3.5" />,
+            badge: Object.values(draft.challenge ?? {}).filter((answer) => answer.trim() !== '').length,
           },
         ]
       : []),
@@ -282,6 +311,21 @@ export function LabPage() {
           </aside>
 
           <section className="min-w-0">
+            <div className="mb-3">
+              <ParameterPanel
+                experiment={experiment}
+                seed={draft.seed}
+                params={draft.params}
+                onChange={(params) => updateAttempt(draft.id, { params })}
+                readOnly={paramsLocked}
+                lockedNote={
+                  assignment
+                    ? `Fixed by ${assignment.teacherName} for “${assignment.title}”.`
+                    : undefined
+                }
+              />
+            </div>
+
             <div className="card overflow-hidden">
               <div className="flex items-center justify-between gap-2 border-b border-ink-100 bg-white/80 px-3 py-2 sm:px-4">
                 <div className="flex items-center gap-2">
@@ -359,6 +403,12 @@ export function LabPage() {
                       updateAttempt(draft.id, { answers: { ...draft.answers, [id]: value } })
                     }
                   />
+                ) : tab === 'test' && assignment ? (
+                  <ChallengePanel
+                    questions={assignment.questions}
+                    answers={draft.challenge}
+                    onChange={(challenge) => updateAttempt(draft.id, { challenge })}
+                  />
                 ) : (
                   <NotesPanel
                     notes={draft.notes}
@@ -408,6 +458,12 @@ export function LabPage() {
                     onChange={(id, value) =>
                       updateAttempt(draft.id, { answers: { ...draft.answers, [id]: value } })
                     }
+                  />
+                ) : tab === 'test' && assignment ? (
+                  <ChallengePanel
+                    questions={assignment.questions}
+                    answers={draft.challenge}
+                    onChange={(challenge) => updateAttempt(draft.id, { challenge })}
                   />
                 ) : (
                   <NotesPanel
@@ -478,15 +534,20 @@ export function LabPage() {
 function Briefing({
   experiment,
   best,
+  assignment,
   onStart,
   onReport,
 }: {
   experiment: ReturnType<typeof getExperiment> & object;
   best: StoredAttempt | null;
+  assignment?: ReturnType<typeof useAppStore.getState>['assignments'][number];
   onStart: () => void;
   onReport: () => void;
 }) {
   const isPhysics = experiment.meta.subject === 'PHYSICS';
+  const fixedParams = parametersFor(experiment as Parameters<typeof parametersFor>[0]).filter(
+    (spec) => assignment?.params?.[spec.id] !== undefined,
+  );
   return (
     <div className="mx-auto max-w-5xl px-4 py-6 sm:px-6 lg:py-8">
       <Link
@@ -495,6 +556,52 @@ function Briefing({
       >
         <ArrowLeft className="h-3.5 w-3.5" /> Back to library
       </Link>
+
+      {assignment ? (
+        <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50/70 p-4 sm:p-5">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="amber">
+              <ClipboardCheck className="h-3 w-3" /> Class test
+            </Badge>
+            <span className="text-[11px] font-medium text-amber-900/70">
+              Set by {assignment.teacherName} · {assignment.classCode}
+            </span>
+            {assignment.dueAt ? (
+              <span className="text-[11px] font-medium text-amber-900/70">
+                · Due {formatDate(assignment.dueAt)}
+              </span>
+            ) : null}
+            {assignment.source === 'AI' ? (
+              <Badge tone="jade">
+                <Sparkles className="h-3 w-3" /> AI challenge
+              </Badge>
+            ) : null}
+          </div>
+          <h2 className="mt-2 text-base font-semibold text-amber-950">{assignment.title}</h2>
+          {assignment.instructions ? (
+            <p className="mt-1 max-w-3xl text-[12px] leading-relaxed text-amber-950/80">
+              {assignment.instructions}
+            </p>
+          ) : null}
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {fixedParams.map((spec) => (
+              <span
+                key={spec.id}
+                className="rounded-md border border-amber-200 bg-white/70 px-2 py-1 font-mono text-[10px] font-semibold text-amber-900"
+              >
+                {spec.label}: {assignment.params[spec.id]}
+                {spec.unit ? ` ${spec.unit}` : ''}
+              </span>
+            ))}
+            {assignment.questions.length > 0 ? (
+              <span className="rounded-md border border-amber-200 bg-white/70 px-2 py-1 text-[10px] font-semibold text-amber-900">
+                {assignment.questions.length} written question
+                {assignment.questions.length === 1 ? '' : 's'}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       <div className="mt-4 overflow-hidden rounded-3xl border border-ink-100 bg-white shadow-card">
         <div className={cn('relative px-5 py-6 sm:px-8 sm:py-8', isPhysics ? 'bench' : 'bg-amber-50/50')}>
@@ -524,7 +631,7 @@ function Briefing({
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button type="button" className="btn-primary" onClick={onStart}>
-              <Play className="h-4 w-4" /> Start practical
+              <Play className="h-4 w-4" /> {assignment ? 'Start test' : 'Start practical'}
             </button>
             {best?.score ? (
               <div className="flex items-center gap-2 rounded-xl border border-ink-200 bg-white/80 px-3 py-1.5">

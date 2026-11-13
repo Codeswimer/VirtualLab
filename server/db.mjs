@@ -58,10 +58,36 @@ const SCHEMA = `
     notes TEXT NOT NULL DEFAULT '',
     score_json TEXT,
     review_json TEXT,
-    scenario_json TEXT
+    scenario_json TEXT,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    assignment_id TEXT,
+    challenge_json TEXT NOT NULL DEFAULT '{}'
   );
 
+  CREATE TABLE IF NOT EXISTS assignments (
+    id TEXT PRIMARY KEY,
+    teacher_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    school_id TEXT NOT NULL,
+    class_code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    experiment_code TEXT NOT NULL,
+    instructions TEXT NOT NULL DEFAULT '',
+    due_at TEXT,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    marking_guide TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'TEACHER' CHECK (source IN ('TEACHER', 'AI')),
+    created_at TEXT NOT NULL
+  );
+
+`;
+
+// Kept separate from SCHEMA so indexes are only created once `migrate` has
+// upgraded databases produced by older versions (e.g. a missing assignment_id).
+const INDEXES = `
   CREATE INDEX IF NOT EXISTS idx_accounts_school ON accounts(school_id);
+  CREATE INDEX IF NOT EXISTS idx_assignments_class ON assignments(school_id, class_code);
+  CREATE INDEX IF NOT EXISTS idx_attempts_assignment ON attempts(assignment_id);
   CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student_id);
   CREATE INDEX IF NOT EXISTS idx_attempts_experiment ON attempts(experiment_code);
 `;
@@ -229,6 +255,57 @@ const SEED_ATTEMPTS = [
   ['demo-s-david', 'CHM-01', 58, 12],
 ];
 
+function addColumn(db, table, column, ddl) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+}
+
+/**
+ * Migrations for databases written by an earlier version, applied in order and
+ * tracked with SQLite's own `PRAGMA user_version`.
+ *
+ * `SCHEMA` above always describes the newest shape, so a fresh database needs
+ * no migrations. Any change to an existing table must therefore appear in both
+ * places: in `SCHEMA` for new files and as a new entry here so that existing
+ * `server/data/*.db` files are upgraded in place on the next start.
+ */
+const MIGRATIONS = [
+  {
+    version: 1,
+    description: 'attempt params, assignment link and challenge answers',
+    up(db) {
+      addColumn(db, 'attempts', 'params_json', "TEXT NOT NULL DEFAULT '{}'");
+      addColumn(db, 'attempts', 'assignment_id', 'TEXT');
+      addColumn(db, 'attempts', 'challenge_json', "TEXT NOT NULL DEFAULT '{}'");
+    },
+  },
+];
+
+const SCHEMA_VERSION = MIGRATIONS.reduce((latest, entry) => Math.max(latest, entry.version), 0);
+
+/** Runs every migration newer than the database's `user_version`, one at a time. */
+function migrate(db) {
+  const stored = Number(db.prepare('PRAGMA user_version').get().user_version) || 0;
+  let current = stored;
+  for (const migration of MIGRATIONS) {
+    if (migration.version <= current) continue;
+    db.exec('BEGIN');
+    try {
+      migration.up(db);
+      db.exec(`PRAGMA user_version = ${migration.version}`);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      error.message = `migration ${migration.version} (${migration.description}) failed: ${error.message}`;
+      throw error;
+    }
+    current = migration.version;
+  }
+  return current;
+}
+
 function seed(db) {
   const insertSchool = db.prepare(
     `INSERT INTO schools (id, name, code, city, state, contact_name, contact_email, status, created_at, approved_at)
@@ -298,6 +375,68 @@ function seed(db) {
         null,
       );
     }
+    // Test assignments so both the teacher authoring and student views have content.
+    const insertAssignment = db.prepare(
+      `INSERT INTO assignments (id, teacher_id, school_id, class_code, title, experiment_code,
+         instructions, due_at, params_json, questions_json, marking_guide, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insertAssignment.run(
+      'demo-assignment-1',
+      'demo-teacher',
+      'school-kcl',
+      'SS2A-KCL',
+      'Pendulum test: determine g',
+      'PHY-01',
+      'Run the pendulum at the amplitude set for you, record five lengths and submit your report. Show the gradient method clearly.',
+      daysAgo(-3, 16),
+      JSON.stringify({ amplitudeDeg: 7.5 }),
+      '[]',
+      '',
+      'TEACHER',
+      daysAgo(1, 8),
+    );
+    insertAssignment.run(
+      'demo-assignment-2',
+      'demo-teacher',
+      'school-kcl',
+      'SS2A-KCL',
+      'WAEC skills: titration precision',
+      'CHM-01',
+      'Complete the titration with the base concentration fixed below, then answer the four written questions.',
+      daysAgo(-5, 16),
+      JSON.stringify({ analyteMolarity: 0.12 }),
+      JSON.stringify([
+        {
+          id: 'q1',
+          prompt: 'Explain why the burette must be rinsed with the acid before it is filled.',
+          marks: 3,
+          markingGuide: 'Removes water so the acid is not diluted; ensures the concentration on the label is the concentration delivered.',
+        },
+        {
+          id: 'q2',
+          prompt: 'State two precautions that improve the accuracy of the end-point.',
+          marks: 4,
+          markingGuide: 'Add dropwise near the end-point; swirl continuously; read the bottom of the meniscus at eye level; use a white tile.',
+        },
+        {
+          id: 'q3',
+          prompt: 'Why are concordant titres used rather than a single reading?',
+          marks: 3,
+          markingGuide: 'Concordant values show random error is small, so the mean is a more reliable estimate.',
+        },
+        {
+          id: 'q4',
+          prompt: 'Calculate the moles of acid in one average titre, using the concentration printed on the bench.',
+          marks: 5,
+          markingGuide: 'n = cV/1000 with the student’s average titre; marks for the substitution, the correct conversion to dm³ and the final unit.',
+        },
+      ]),
+      'Award method marks for correct formulae even where arithmetic slips. The report rubric also marks the readings and calculation.',
+      'AI',
+      daysAgo(1, 9),
+    );
+
     // One submission already marked by the teacher so the workflow is visible.
     const reviewed = db
       .prepare(
@@ -330,6 +469,10 @@ export function createDatabase(filePath) {
   }
   const db = new DatabaseSync(filePath);
   db.exec(SCHEMA);
+  migrate(db);
+  // Indexes come after the migrations: they may reference columns that older
+  // databases only gain in the migration above.
+  db.exec(INDEXES);
   const row = db.prepare('SELECT COUNT(*) AS count FROM schools').get();
   if (Number(row.count) === 0) seed(db);
   return db;
@@ -343,4 +486,4 @@ export function resetDatabaseFile(filePath) {
   if (fs.existsSync(shm)) fs.rmSync(shm, { force: true });
 }
 
-export { gradeFor, makeId, now };
+export { gradeFor, makeId, now, SCHEMA_VERSION };

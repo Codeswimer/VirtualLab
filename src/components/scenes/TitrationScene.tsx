@@ -1,5 +1,10 @@
-import { useMemo, useState } from 'react';
-import { Check, Droplet, RotateCcw, Waves } from 'lucide-react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { ContactShadows, OrbitControls } from '@react-three/drei';
+import { CuboidCollider, CylinderCollider, Physics, RigidBody } from '@react-three/rapier';
+import type { RapierRigidBody } from '@react-three/rapier';
+import { Check, Droplet, Info, RotateCcw } from 'lucide-react';
+import * as THREE from 'three';
 import {
   indicatorColourName,
   indicatorColor,
@@ -8,8 +13,22 @@ import {
   TITRATION_SYSTEMS,
   type TitrationSystem,
 } from '@sim/chemistry/titration';
-import { ControlBar, Readout, SceneButton, SceneHint, Stage } from './kit';
+import {
+  buretteFlowRateCm3PerSecond,
+  isDropwise,
+  liquidFraction,
+  transferVolumeCm3,
+} from './physics/bench-physics';
+import { Graduations, LiquidColumn, PourStream } from './physics/visuals';
+import { useBodyDrag } from './physics/use-body-drag';
+import { ControlBar, Readout, SceneButton, SceneHint } from './kit';
 import type { SceneProps } from './types';
+
+const BURETTE_X = 0.52;
+const BURETTE_Z = 0.12;
+const TIP: [number, number, number] = [BURETTE_X, 1.1, BURETTE_Z];
+const FLASK_HOME: [number, number, number] = [BURETTE_X, 0.03, BURETTE_Z];
+const FLASK_MOUTH_Y = 0.63;
 
 export function TitrationScene({ experiment, scenario, onRecord, onFlag }: SceneProps) {
   const isRedox = experiment.meta.code === 'CHM-03';
@@ -23,10 +42,16 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
     isHydrate ? 'methylOrange' : null,
   );
   const [added, setAdded] = useState(0);
-  const [lastStep, setLastStep] = useState(0);
-  const [swirling, setSwirling] = useState(false);
+  const [delivered, setDelivered] = useState(0);
+  const [spilled, setSpilled] = useState(0);
+  const [opening, setOpening] = useState(0);
+  const [pouring, setPouring] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [tapActive, setTapActive] = useState(false);
   const [rinsed, setRinsed] = useState(false);
   const [recorded, setRecorded] = useState(0);
+  const addedRef = useRef(0);
+  const lastRate = useRef(0);
 
   const activeIndicator = isHydrate ? 'methylOrange' : indicatorId;
   const spec = indicatorSpec(activeIndicator ?? 'methylOrange');
@@ -46,13 +71,13 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
 
   const colour = isRedox
     ? endpointReached
-      ? 'rgba(244,114,182,0.55)'
+      ? 'rgba(244,114,182,0.62)'
       : added > 0
-        ? 'rgba(168,85,247,0.55)'
-        : 'rgba(226,232,240,0.55)'
+        ? 'rgba(168,85,247,0.6)'
+        : 'rgba(226,232,240,0.5)'
     : activeIndicator
       ? indicatorColor(spec, pH)
-      : 'rgba(226,232,240,0.55)';
+      : 'rgba(226,232,240,0.5)';
   const colourName = isRedox
     ? endpointReached
       ? 'pale pink (permanent)'
@@ -67,114 +92,111 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
     : TITRATION_SYSTEMS[system].label;
 
   const buretteReading = useMemo(() => Math.round(added / 0.05) * 0.05, [added]);
-  const liquidTop = 56 + (added / 50) * 190;
+  const flaskLevel = liquidFraction(25 + added, 130);
 
-  const addVolume = (amount: number) => {
-    const next = Math.min(48, Number((added + amount).toFixed(2)));
-    setAdded(next);
-    setLastStep(amount);
-    if (amount <= 0.1 && nearEndpoint) onFlag('dropwise');
-    if (amount <= 0.1) setSwirling(true);
-    if (isRedox && next >= equivalentVolume - 0.05) onFlag('self-indicating');
-    if (!isRedox && activeIndicator && activeIndicator === scenario.indicatorId) {
-      onFlag('indicator-correct');
-    }
-    if (isHydrate && activeIndicator === 'methylOrange') onFlag('indicator-correct');
-  };
+  const handleDeliver = useCallback(
+    (delta: number, rate: number, overFlask: boolean) => {
+      if (delta <= 0) return;
+      lastRate.current = rate;
+      setDelivered((value) => Math.min(50, value + delta));
+      if (!overFlask) {
+        setSpilled((value) => value + delta);
+        return;
+      }
+      addedRef.current = Math.min(48, addedRef.current + delta);
+      setAdded(addedRef.current);
+      if (isDropwise(rate) && Math.abs(addedRef.current - equivalentVolume) < 2.5) {
+        onFlag('dropwise');
+      }
+      if (isRedox && addedRef.current >= equivalentVolume - 0.05) {
+        onFlag('self-indicating');
+      }
+    },
+    [equivalentVolume, isRedox, onFlag],
+  );
+
+  const recordTitre = useCallback(() => {
+    const final = Math.round(addedRef.current / 0.05) * 0.05;
+    if (final < 0.05) return;
+    onRecord({ initial: '0.00', final: final.toFixed(2), titre: final.toFixed(2) });
+    setRecorded((value) => value + 1);
+    if (isDropwise(lastRate.current)) onFlag('dropwise');
+    if (isRedox) onFlag('self-indicating');
+    addedRef.current = 0;
+    setAdded(0);
+    setDelivered(0);
+    setSpilled(0);
+    setPouring(false);
+  }, [isRedox, onFlag, onRecord]);
 
   return (
     <div>
-      <Stage caption="Burette of acid above a conical flask of base and indicator">
-        <svg viewBox="0 0 560 340" className="w-full" role="img" aria-label="Burette and conical flask during a titration">
-          <defs>
-            <linearGradient id="glass-tube" x1="0" y1="0" x2="1" y2="0">
-              <stop offset="0" stopColor="#ffffff" stopOpacity="0.85" />
-              <stop offset="0.4" stopColor="#e0f2fe" stopOpacity="0.4" />
-              <stop offset="1" stopColor="#bae6fd" stopOpacity="0.55" />
-            </linearGradient>
-            <linearGradient id="acid" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#fef9c3" stopOpacity="0.9" />
-              <stop offset="1" stopColor="#fde68a" stopOpacity="0.8" />
-            </linearGradient>
-            <linearGradient id="flask-glass" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stopColor="#f8fafc" stopOpacity="0.75" />
-              <stop offset="1" stopColor="#cbd5e1" stopOpacity="0.45" />
-            </linearGradient>
-          </defs>
-          <rect x="0" y="312" width="560" height="28" fill="#ded3b9" />
+      <div className="relative overflow-hidden rounded-xl bg-[#f1ede3]">
+        <div className="h-[400px] w-full sm:h-[460px]">
+          <Canvas
+            dpr={[1, 1.75]}
+            camera={{ position: [1.9, 1.85, 3.0], fov: 38 }}
+            gl={{ antialias: true, alpha: true }}
+          >
+            <color attach="background" args={['#f1ede3']} />
+            <fog attach="fog" args={['#f1ede3', 6, 11]} />
+            <ambientLight intensity={0.7} />
+            <directionalLight
+              position={[3, 6, 4]}
+              intensity={2}
+              castShadow
+              shadow-mapSize={[1024, 1024]}
+            />
+            <directionalLight position={[-4, 2, -2]} intensity={0.5} color="#dbeafe" />
+            <Suspense fallback={null}>
+              <Physics gravity={[0, -9.81, 0]} timeStep={1 / 60}>
+                <TitrationRig
+                  colour={colour}
+                  flaskLevel={flaskLevel}
+                  delivered={delivered}
+                  onDeliver={handleDeliver}
+                  onOpening={(value) => setOpening(value)}
+                  onPouring={(value) => setPouring(value)}
+                  onDraggingChange={(value) => setDragging(value)}
+                  onTapActive={(value) => setTapActive(value)}
+                />
+              </Physics>
+            </Suspense>
+            <ContactShadows position={[0, 0.01, 0]} opacity={0.32} scale={6} blur={2.3} far={4} />
+            <OrbitControls
+              enabled={!dragging && !tapActive}
+              enablePan={false}
+              minDistance={2.5}
+              maxDistance={6}
+              minPolarAngle={0.55}
+              maxPolarAngle={1.45}
+              target={[0.3, 1.25, 0]}
+            />
+          </Canvas>
+        </div>
 
-          {/* Stand */}
-          <rect x="72" y="22" width="12" height="290" rx="4" fill="#64748b" />
-          <rect x="46" y="306" width="80" height="10" rx="4" fill="#475569" />
-          <rect x="84" y="54" width="74" height="8" rx="3" fill="#475569" />
-          <rect x="84" y="210" width="54" height="8" rx="3" fill="#475569" />
+        <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-white/85 px-2.5 py-1.5 backdrop-blur-sm">
+          <p className="text-[9px] font-bold uppercase tracking-wider text-ink-400">Titration bench</p>
+          <p className="font-mono text-[11px] font-semibold text-ink-800">
+            {buretteReading.toFixed(2)} cm³ delivered
+          </p>
+        </div>
 
-          {/* Burette */}
-          <g>
-            <rect x="142" y="34" width="26" height="210" rx="4" fill="url(#glass-tube)" stroke="#94a3b8" />
-            <rect x={146} y={liquidTop} width="18" height={234 - liquidTop} rx="3" fill="url(#acid)" style={{ transition: 'all 220ms ease' }} />
-            {Array.from({ length: 11 }, (_, i) => (
-              <g key={i}>
-                <line x1="142" y1={56 + i * 19} x2={i % 5 === 0 ? 132 : 137} y2={56 + i * 19} stroke="#475569" strokeWidth="0.9" />
-                <text x="128" y={59 + i * 19} textAnchor="end" className="fill-ink-400" style={{ fontSize: 6.5, fontFamily: 'JetBrains Mono Variable, monospace' }}>
-                  {i * 5}
-                </text>
-              </g>
-            ))}
-            <text x="155" y="24" textAnchor="middle" className="fill-ink-500" style={{ fontSize: 7.5 }}>burette / cm³</text>
+        <div className="pointer-events-none absolute right-3 top-3 rounded-lg bg-[#0d2b24]/95 px-3 py-2 text-right">
+          <p className="text-[8px] font-bold uppercase tracking-[0.14em] text-jade-300">Burette</p>
+          <p className="font-mono text-xl font-semibold tabular-nums text-jade-100">
+            {buretteReading.toFixed(2)}
+            <span className="ml-1 text-[9px] text-jade-400">cm³</span>
+          </p>
+          <p className="text-[8px] text-jade-400">
+            tap {opening > 0.01 ? `${Math.round(opening * 100)}% open` : 'closed'}
+          </p>
+        </div>
 
-            {/* Tap */}
-            <rect x="150" y="244" width="10" height="16" fill="#94a3b8" />
-            <ellipse cx="155" cy="262" rx="12" ry="5" fill="#64748b" />
-            <circle cx="155" cy="262" r="3" fill="#334155" />
-            <path d="M 155 268 L 155 288" stroke="#e2e8f0" strokeWidth="2.5" />
-          </g>
-
-          {/* Flask */}
-          <g transform="translate(300 214)">
-            <path d="M -18 0 L -70 92 Q -74 100 -64 100 L 64 100 Q 74 100 70 92 L 18 0 Z" fill="url(#flask-glass)" stroke="#94a3b8" strokeWidth="2" />
-            <path d="M -58 64 Q -60 96 -52 96 L 52 96 Q 60 96 58 64 Z" fill={colour} style={{ transition: 'fill 500ms ease' }} />
-            <ellipse cx="0" cy="64" rx="58" ry="7" fill={colour} opacity="0.9" style={{ transition: 'fill 500ms ease' }} />
-            {swirling ? (
-              <ellipse cx="0" cy="66" rx="46" ry="4" fill="none" stroke="#ffffff" strokeOpacity="0.6" strokeWidth="1.5">
-                <animate attributeName="rx" values="20;50;20" dur="1.2s" repeatCount="indefinite" />
-              </ellipse>
-            ) : null}
-            <text x="0" y="118" textAnchor="middle" className="fill-ink-500" style={{ fontSize: 7.5 }}>
-              {scenario.analyteName as string} + indicator
-            </text>
-            <text x="0" y="80" textAnchor="middle" fill="rgba(15,23,42,0.6)" style={{ fontSize: 7 }}>
-              25.0 cm³ pipetted
-            </text>
-          </g>
-
-          {/* White tile */}
-          <rect x="212" y="314" width="180" height="8" rx="2" fill="#f8fafc" stroke="#cbd5e1" />
-
-          <g transform="translate(444 46)">
-            <rect width="96" height="92" rx="10" fill="#ffffff" stroke="#e2e8f0" />
-            <text x="10" y="16" fill="#94a3b8" style={{ fontSize: 6.5, fontWeight: 700, letterSpacing: 0.8 }}>BURETTE</text>
-            <text x="10" y="38" fill="#0f2b24" style={{ fontSize: 17, fontFamily: 'JetBrains Mono Variable, monospace', fontWeight: 600 }}>
-              {buretteReading.toFixed(2)}
-            </text>
-            <text x="10" y="50" fill="#94a3b8" style={{ fontSize: 6.5 }}>cm³ delivered</text>
-            <text x="10" y="66" fill="#94a3b8" style={{ fontSize: 6.5, fontWeight: 700, letterSpacing: 0.8 }}>INDICATOR</text>
-            <text x="10" y="82" fill="#0f2b24" style={{ fontSize: 7.5, fontWeight: 600 }}>
-              {indicatorId ? (indicatorId === 'methylOrange' ? 'methyl orange' : 'phenolphthalein') : 'none'}
-            </text>
-          </g>
-
-          <g transform="translate(444 152)">
-            <rect width="96" height="70" rx="10" fill="#ffffff" stroke="#e2e8f0" />
-            <text x="10" y="16" fill="#94a3b8" style={{ fontSize: 6.5, fontWeight: 700, letterSpacing: 0.8 }}>COLOUR</text>
-            <circle cx="20" cy="36" r="8" fill={colour} stroke="#cbd5e1" />
-            <text x="34" y="40" fill="#0f2b24" style={{ fontSize: 7.5, fontWeight: 600 }}>{colourName}</text>
-            <text x="10" y="60" fill={endpointReached ? '#106849' : '#94a3b8'} style={{ fontSize: 7, fontWeight: 600 }}>
-              {endpointReached ? 'end-point reached' : 'not at end-point'}
-            </text>
-          </g>
-        </svg>
-      </Stage>
+        <div className="pointer-events-none absolute bottom-2 left-3 flex items-center gap-1 text-[9px] font-medium text-ink-500">
+          <Droplet className="h-3 w-3" /> Drag the stopcock down to open · drag the flask to swirl
+        </div>
+      </div>
 
       <ControlBar>
         {isRedox ? (
@@ -191,7 +213,9 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
               active={indicatorId === 'methylOrange'}
               onClick={() => {
                 setIndicatorId('methylOrange');
+                addedRef.current = 0;
                 setAdded(0);
+                setDelivered(0);
                 if (scenario.indicatorId === 'methylOrange') onFlag('indicator-correct');
               }}
             >
@@ -201,7 +225,9 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
               active={indicatorId === 'phenolphthalein'}
               onClick={() => {
                 setIndicatorId('phenolphthalein');
+                addedRef.current = 0;
                 setAdded(0);
+                setDelivered(0);
                 if (scenario.indicatorId === 'phenolphthalein') onFlag('indicator-correct');
               }}
             >
@@ -221,26 +247,14 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
         </SceneButton>
         <SceneButton
           tone="primary"
-          disabled={(!activeIndicator && !isRedox) || added <= 0}
-          onClick={() => {
-            const final = Number((Math.round(added / 0.05) * 0.05).toFixed(2));
-            onRecord({
-              initial: '0.00',
-              final: final.toFixed(2),
-              titre: final.toFixed(2),
-            });
-            setRecorded((value) => value + 1);
-            setAdded(0);
-            setLastStep(0);
-            if (lastStep <= 0.1) onFlag('dropwise');
-            if (isRedox) onFlag('self-indicating');
-          }}
+          disabled={(!activeIndicator && !isRedox) || added < 0.05 || pouring}
+          onClick={recordTitre}
         >
           <Check className="h-3 w-3" /> Record titre
         </SceneButton>
       </ControlBar>
 
-      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+      <div className="mt-2 grid gap-2 sm:grid-cols-4">
         <Readout label="Acid added" value={added.toFixed(2)} unit="cm³" size="sm" />
         <Readout
           label={isRedox ? 'Solution colour' : 'Indicator colour'}
@@ -254,47 +268,360 @@ export function TitrationScene({ experiment, scenario, onRecord, onFlag }: Scene
           size="sm"
           hint="aim for 3 concordant"
         />
+        <Readout
+          label="Spilled"
+          value={spilled.toFixed(2)}
+          unit="cm³"
+          size="sm"
+          tone={spilled > 0 ? 'red' : 'ink'}
+          hint={spilled > 0 ? 'keep the flask under the jet' : 'no spillage'}
+        />
       </div>
-
-      {activeIndicator || isRedox ? (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          <SceneButton onClick={() => addVolume(5)}>+ 5.00</SceneButton>
-          <SceneButton onClick={() => addVolume(1)}>+ 1.00</SceneButton>
-          <SceneButton onClick={() => addVolume(0.5)}>+ 0.50</SceneButton>
-          <SceneButton onClick={() => addVolume(0.1)} active={lastStep === 0.1}>
-            <Droplet className="h-3 w-3" /> + 0.10
-          </SceneButton>
-          <SceneButton onClick={() => addVolume(0.05)}>+ 0.05</SceneButton>
-          <SceneButton
-            active={swirling}
-            onClick={() => setSwirling((value) => !value)}
-            tone="ghost"
-          >
-            <Waves className="h-3 w-3" /> Swirl
-          </SceneButton>
-        </div>
-      ) : null}
 
       <div className="mt-2">
         <SceneHint tone={activeIndicator || isRedox ? (endpointReached ? 'jade' : 'neutral') : 'amber'}>
           {isRedox
             ? endpointReached
-              ? 'The first permanent pink is the end-point. Record the titre and repeat for concordant values.'
-              : 'No indicator: permanganate is self-indicating. Add drops near the end and stop at the first permanent pink.'
+              ? 'The first permanent pink is the end-point. Close the tap and record the titre.'
+              : 'No indicator: permanganate is self-indicating. Open the tap a little and close it as the pink appears.'
             : !activeIndicator
               ? 'Choose the indicator for this titration. Check the theory card if you are unsure.'
               : endpointReached
-                ? 'The colour has changed permanently. Record the titre, then refill and repeat.'
-                : lastStep > 0.5
-                  ? 'Running in too fast near the end-point risks overshooting. Switch to drops.'
-                  : 'Swirl the flask continuously. Stop at the first permanent colour change.'}
+                ? 'The colour has changed permanently. Close the tap, then record the titre and repeat.'
+                : pouring
+                  ? nearEndpoint
+                    ? 'You are close to the end-point. Almost close the tap so the acid goes in dropwise.'
+                    : 'Watch the flask. The colour will change sharply near the end-point.'
+                  : 'Drag the stopcock down to open it. Drag the flask in small circles to mix without moving it off the jet.'}
         </SceneHint>
       </div>
 
-      <p className="mt-2 text-[10px] text-ink-400">
-        {systemLabel} · acid in the burette, {String(scenario.analyteName ?? 'iron(II) solution')} in
-        the flask.
+      <p className="mt-2 flex items-center gap-1 text-[10px] text-ink-400">
+        <Info className="h-3 w-3" /> {systemLabel} · acid in the burette,{' '}
+        {String(scenario.analyteName ?? 'iron(II) solution')} in the flask. The burette reads to
+        0.05 cm³ and the flask liquid is drawn from the volume you actually deliver.
       </p>
     </div>
   );
 }
+
+function TitrationRig({
+  colour,
+  flaskLevel,
+  delivered,
+  onDeliver,
+  onOpening,
+  onPouring,
+  onDraggingChange,
+  onTapActive,
+}: {
+  colour: string;
+  flaskLevel: number;
+  delivered: number;
+  onDeliver: (delta: number, rate: number, overFlask: boolean) => void;
+  onOpening: (opening: number) => void;
+  onPouring: (pouring: boolean) => void;
+  onDraggingChange: (dragging: boolean) => void;
+  onTapActive: (active: boolean) => void;
+}) {
+  const { pointer } = useThree();
+  const flaskRef = useRef<RapierRigidBody>(null);
+  const leverRef = useRef<THREE.Group>(null);
+  const tapActive = useRef(false);
+  const tapStartY = useRef(0);
+  const opening = useRef(0);
+  const sourceUsed = useRef(0);
+  const accumulator = useRef(0);
+  const minRate = useRef(0);
+  const lastEmit = useRef(0);
+  const lastOpening = useRef(0);
+  const pouringRef = useRef(false);
+  const [flaskPosition, setFlaskPosition] = useState<[number, number, number]>(FLASK_HOME);
+  const [hovered, setHovered] = useState(false);
+
+  useEffect(() => {
+    if (delivered === 0) sourceUsed.current = 0;
+  }, [delivered]);
+
+  const { bind } = useBodyDrag(flaskRef, {
+    follow: 14,
+    maxSpeed: 1.4,
+    getPoint: (body, out) => {
+      const t = body.translation();
+      out.set(t.x, t.y + 0.28, t.z);
+      return true;
+    },
+    onGrab: () => onDraggingChange(true),
+    onRelease: () => onDraggingChange(false),
+  });
+
+  useFrame((state, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
+
+    if (tapActive.current) {
+      opening.current = Math.min(
+        1,
+        Math.max(0, (tapStartY.current - state.pointer.y) * 2.6),
+      );
+    } else {
+      opening.current = 0;
+    }
+
+    if (leverRef.current) {
+      leverRef.current.rotation.z = -opening.current * 1.15;
+    }
+
+    const now = performance.now();
+    if (Math.abs(opening.current - lastOpening.current) > 0.01 && now - lastEmit.current > 80) {
+      lastOpening.current = opening.current;
+      onOpening(opening.current);
+    }
+
+    const flask = flaskRef.current;
+    if (!flask) return;
+    const t = flask.translation();
+    const overFlask =
+      Math.hypot(t.x - TIP[0], t.z - TIP[2]) < 0.24 &&
+      t.y < 0.35;
+    const rate = buretteFlowRateCm3PerSecond(opening.current);
+
+    if (rate > 0 && sourceUsed.current < 50) {
+      const volume = transferVolumeCm3(rate, delta, 50 - sourceUsed.current);
+      sourceUsed.current += volume;
+      accumulator.current += volume;
+      if (minRate.current === 0 || rate < minRate.current) minRate.current = rate;
+
+      if (!pouringRef.current) {
+        pouringRef.current = true;
+        onPouring(true);
+      }
+
+      if (accumulator.current >= 0.02 && now - lastEmit.current > 70) {
+        lastEmit.current = now;
+        onDeliver(accumulator.current, minRate.current, overFlask);
+        accumulator.current = 0;
+        minRate.current = rate;
+      }
+
+      setFlaskPosition((previous) =>
+        Math.abs(previous[0] - t.x) + Math.abs(previous[2] - t.z) > 0.01
+          ? [t.x, t.y, t.z]
+          : previous,
+      );
+    } else if (pouringRef.current) {
+      pouringRef.current = false;
+      onPouring(false);
+      lastEmit.current = 0;
+      minRate.current = 0;
+    }
+  });
+
+  return (
+    <group>
+      <mesh receiveShadow position={[0, -0.02, 0]}>
+        <boxGeometry args={[5.5, 0.08, 3.2]} />
+        <meshStandardMaterial color="#d8c9a5" roughness={0.85} />
+      </mesh>
+      <mesh position={[0, 0.03, 0]}>
+        <boxGeometry args={[5.5, 0.02, 3.2]} />
+        <meshStandardMaterial color="#e9dec4" roughness={0.7} />
+      </mesh>
+
+      {/* White tile under the flask */}
+      <mesh receiveShadow position={[BURETTE_X, 0.026, BURETTE_Z]}>
+        <boxGeometry args={[0.75, 0.012, 0.55]} />
+        <meshStandardMaterial color="#f8fafc" roughness={0.5} />
+      </mesh>
+
+      <RigidBody type="fixed" colliders={false} position={[0, -0.08, 0]}>
+        <CuboidCollider args={[2.75, 0.1, 1.6]} />
+      </RigidBody>
+
+      {/* Retort stand */}
+      <mesh castShadow position={[BURETTE_X - 0.38, 1.25, BURETTE_Z - 0.2]}>
+        <cylinderGeometry args={[0.032, 0.042, 2.5, 24]} />
+        <meshStandardMaterial color="#59616c" metalness={0.55} roughness={0.35} />
+      </mesh>
+      <CuboidColliderProxy position={[BURETTE_X - 0.38, 1.25, BURETTE_Z - 0.2]} />
+      <mesh position={[BURETTE_X - 0.2, 2.44, BURETTE_Z - 0.2]} castShadow>
+        <boxGeometry args={[0.42, 0.05, 0.05]} />
+        <meshStandardMaterial color="#59616c" metalness={0.55} roughness={0.35} />
+      </mesh>
+      <mesh position={[BURETTE_X - 0.02, 2.44, BURETTE_Z - 0.2]}>
+        <boxGeometry args={[0.1, 0.12, 0.1]} />
+        <meshStandardMaterial color="#2f3540" metalness={0.6} roughness={0.3} />
+      </mesh>
+
+      {/* Burette tube */}
+      <mesh position={[BURETTE_X, 1.86, BURETTE_Z]}>
+        <cylinderGeometry args={[0.048, 0.048, 1.22, 28, 1, true]} />
+        <meshPhysicalMaterial
+          color="#e0f2fe"
+          transparent
+          opacity={0.28}
+          roughness={0.08}
+          metalness={0}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <LiquidColumn
+        base={[BURETTE_X, 1.27, BURETTE_Z]}
+        radiusBottom={0.04}
+        radiusTop={0.04}
+        height={1.14}
+        level={liquidFraction(50 - delivered, 50)}
+        color="#fde68a"
+        opacity={0.78}
+      />
+      <Graduations
+        position={[BURETTE_X + 0.055, 1.3, BURETTE_Z]}
+        height={1.08}
+        count={12}
+        width={0.075}
+        color="#334155"
+      />
+
+      {/* Stopcock and lever */}
+      <mesh position={[BURETTE_X, 1.22, BURETTE_Z]}>
+        <sphereGeometry args={[0.055, 20, 20]} />
+        <meshStandardMaterial color="#94a3b8" roughness={0.35} metalness={0.4} />
+      </mesh>
+      <group ref={leverRef} position={[BURETTE_X, 1.22, BURETTE_Z + 0.05]}>
+        <mesh position={[0.075, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.012, 0.012, 0.15, 12]} />
+          <meshStandardMaterial color="#334155" metalness={0.6} roughness={0.3} />
+        </mesh>
+        <mesh
+          position={[0.16, 0, 0]}
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            tapActive.current = true;
+            tapStartY.current = pointer.y;
+            (
+              event.target as unknown as { setPointerCapture?: (id: number) => void }
+            ).setPointerCapture?.(event.pointerId);
+            document.body.style.cursor = 'grabbing';
+            onTapActive(true);
+          }}
+          onPointerUp={(event) => {
+            tapActive.current = false;
+            (
+              event.target as unknown as { releasePointerCapture?: (id: number) => void }
+            ).releasePointerCapture?.(event.pointerId);
+            document.body.style.cursor = '';
+            onTapActive(false);
+          }}
+          onPointerCancel={() => {
+            tapActive.current = false;
+            onTapActive(false);
+          }}
+          onPointerOver={(event) => {
+            event.stopPropagation();
+            setHovered(true);
+            document.body.style.cursor = 'grab';
+          }}
+          onPointerOut={() => {
+            setHovered(false);
+            document.body.style.cursor = '';
+          }}
+        >
+          <sphereGeometry args={[0.07, 20, 20]} />
+          <meshStandardMaterial
+            color={hovered ? '#0f766e' : '#1f2937'}
+            metalness={0.4}
+            roughness={0.4}
+            emissive={hovered ? '#0f766e' : '#000000'}
+            emissiveIntensity={hovered ? 0.4 : 0}
+          />
+        </mesh>
+      </group>
+
+      {/* Burette tip */}
+      <mesh position={[BURETTE_X, 1.13, BURETTE_Z]}>
+        <coneGeometry args={[0.03, 0.12, 16]} />
+        <meshStandardMaterial color="#94a3b8" roughness={0.3} metalness={0.4} />
+      </mesh>
+
+      {/* Conical flask */}
+      <RigidBody
+        ref={flaskRef}
+        colliders={false}
+        position={FLASK_HOME}
+        canSleep={false}
+        lockRotations
+        linearDamping={0.4}
+      >
+        <CylinderCollider args={[0.16, 0.19]} position={[0, 0.16, 0]} />
+        <group
+          onPointerOver={(event) => {
+            event.stopPropagation();
+            document.body.style.cursor = 'grab';
+          }}
+          onPointerOut={() => {
+            document.body.style.cursor = '';
+          }}
+          {...bind}
+        >
+          <mesh position={[0, 0.3, 0]}>
+            <cylinderGeometry args={[0.055, 0.2, 0.5, 32, 1, true]} />
+            <meshPhysicalMaterial
+              color="#e2e8f0"
+              transparent
+              opacity={0.28}
+              roughness={0.08}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+          <mesh position={[0, 0.6, 0]}>
+            <cylinderGeometry args={[0.062, 0.062, 0.16, 28, 1, true]} />
+            <meshPhysicalMaterial
+              color="#e2e8f0"
+              transparent
+              opacity={0.24}
+              roughness={0.08}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+          <mesh position={[0, 0.05, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <circleGeometry args={[0.2, 32]} />
+            <meshPhysicalMaterial color="#e2e8f0" transparent opacity={0.3} />
+          </mesh>
+          <LiquidColumn
+            base={[0, 0.06, 0]}
+            radiusBottom={0.185}
+            radiusTop={0.075}
+            height={0.48}
+            level={flaskLevel}
+            color={colour}
+            opacity={0.72}
+          />
+        </group>
+      </RigidBody>
+
+      {/* Pour stream */}
+      <PourStream
+        from={[TIP[0], TIP[1] - 0.02, TIP[2]]}
+        to={
+          pouringRef.current
+            ? [flaskPosition[0], FLASK_MOUTH_Y, flaskPosition[2]]
+            : [TIP[0], 0.06, TIP[2]]
+        }
+        color={colour}
+        visible={pouringRef.current}
+      />
+    </group>
+  );
+}
+
+/**
+ * The retort stand is visual; the collider keeps the flask from passing through
+ * it when the student drags the flask around the bench.
+ */
+function CuboidColliderProxy({ position }: { position: [number, number, number] }) {
+  return (
+    <RigidBody type="fixed" colliders={false} position={position}>
+      <CuboidCollider args={[0.05, 1.25, 0.05]} />
+    </RigidBody>
+  );
+}
+

@@ -158,7 +158,66 @@ function mapAttempt(row) {
     score: parseJson(row.score_json, undefined),
     review: parseJson(row.review_json, undefined),
     scenarioSnapshot: parseJson(row.scenario_json, undefined),
+    params: parseJson(row.params_json, {}),
+    assignmentId: row.assignment_id ?? undefined,
+    challenge: parseJson(row.challenge_json, {}),
   };
+}
+
+const ASSIGNMENT_SELECT = `
+  SELECT asg.*, a.name AS teacher_name
+  FROM assignments asg
+  JOIN accounts a ON a.id = asg.teacher_id
+`;
+
+function mapAssignment(row, redactGuides = false) {
+  const questions = parseJson(row.questions_json, []);
+  return {
+    id: row.id,
+    teacherId: row.teacher_id,
+    teacherName: row.teacher_name ?? 'Teacher',
+    schoolId: row.school_id,
+    classCode: row.class_code,
+    title: row.title,
+    experimentCode: row.experiment_code,
+    instructions: row.instructions ?? '',
+    dueAt: row.due_at ?? undefined,
+    params: parseJson(row.params_json, {}),
+    // Students receive the questions but never the examiner's marking guide.
+    questions: redactGuides
+      ? questions.map((question) => ({ ...question, markingGuide: '' }))
+      : questions,
+    markingGuide: redactGuides ? '' : (row.marking_guide ?? ''),
+    source: row.source ?? 'TEACHER',
+    createdAt: row.created_at,
+  };
+}
+
+function numberMap(value, limit = 24) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const result = {};
+  for (const [key, raw] of Object.entries(value).slice(0, limit)) {
+    const numeric = typeof raw === 'string' ? Number(raw) : raw;
+    if (!key || typeof numeric !== 'number' || !Number.isFinite(numeric)) continue;
+    result[key.slice(0, 40)] = numeric;
+  }
+  return result;
+}
+
+function cleanQuestions(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .slice(0, 8)
+    .map((entry, index) => {
+      const marks = Number(entry?.marks);
+      return {
+        id: text(entry?.id, 40) || `q${index + 1}`,
+        prompt: text(entry?.prompt, 600),
+        marks: Number.isFinite(marks) ? Math.min(10, Math.max(1, Math.round(marks))) : 1,
+        markingGuide: text(entry?.markingGuide, 1200),
+      };
+    })
+    .filter((entry) => entry.prompt);
 }
 
 function getSchool(db, id) {
@@ -248,6 +307,24 @@ function accountRowsFor(db, actor) {
       .all(actor.id, actor.schoolId, actor.classCode);
   }
   return db.prepare(`${ACCOUNT_SELECT} WHERE a.id = ?`).all(actor.id);
+}
+
+function assignmentRowsFor(db, actor) {
+  if (actor.role === 'ADMIN') {
+    return db.prepare(`${ASSIGNMENT_SELECT} ORDER BY asg.created_at DESC`).all();
+  }
+  if (actor.role === 'SCHOOL_ADMIN') {
+    return db
+      .prepare(`${ASSIGNMENT_SELECT} WHERE asg.school_id = ? ORDER BY asg.created_at DESC`)
+      .all(actor.schoolId);
+  }
+  return db
+    .prepare(
+      `${ASSIGNMENT_SELECT}
+       WHERE asg.school_id = ? AND asg.class_code = ?
+       ORDER BY asg.created_at DESC`,
+    )
+    .all(actor.schoolId, actor.classCode);
 }
 
 function attemptRowsFor(db, actor) {
@@ -389,6 +466,9 @@ function bootstrap(db, actor) {
     schools: schools.map(mapSchool),
     accounts: accountRowsFor(db, actor).map(mapAccount),
     attempts: attemptRowsFor(db, actor).map(mapAttempt),
+    assignments: assignmentRowsFor(db, actor).map((row) =>
+      mapAssignment(row, actor.role === 'STUDENT'),
+    ),
     leaderboard: buildLeaderboardRows(db),
     serverTime: now(),
   };
@@ -446,6 +526,156 @@ function applyAttemptPayloadDefaults(body) {
     flags: body.flags && typeof body.flags === 'object' ? body.flags : {},
     notes: text(body.notes, 12000),
   };
+}
+
+/** Preferred model first, then a lighter fallback for demand spikes. */
+const aiModels = () => {
+  const configured = (process.env.GEMINI_MODEL ?? '').trim();
+  return [...new Set([configured || 'gemini-3.1-flash-lite', 'gemini-3.6-flash'])];
+};
+
+function coerceChallenge(payload, questionCount) {
+  const title = text(payload?.title, 140);
+  const objective = text(payload?.objective, 500);
+  const instructions = text(payload?.instructions, 1200);
+  const waecReference = text(payload?.waecReference, 160);
+  const markingGuide = text(payload?.markingGuide, 2000);
+  const questions = cleanQuestions(payload?.questions)
+    .slice(0, Math.max(2, Math.min(6, questionCount)))
+    .map((entry, index) => ({ ...entry, id: `q${index + 1}` }));
+  if (!title || questions.length < 2) {
+    throw new HttpError(502, 'The AI returned an incomplete challenge. Try generating again.');
+  }
+  return {
+    title,
+    waecReference: waecReference || 'WAEC practical syllabus',
+    objective,
+    instructions,
+    questions,
+    markingGuide,
+  };
+}
+
+async function generateAiChallenge(input) {
+  const apiKey = (process.env.GEMINI_API_KEY ?? '').trim();
+  if (!apiKey) {
+    throw new HttpError(
+      503,
+      'The AI challenge generator is not configured. Add GEMINI_API_KEY to the server environment.',
+    );
+  }
+
+  const subject = input.subject === 'CHEMISTRY' ? 'Chemistry' : 'Physics';
+  const gradeLevel = text(input.gradeLevel, 12) || 'SS2';
+  const difficulty = ['foundation', 'standard', 'extension'].includes(input.difficulty)
+    ? input.difficulty
+    : 'standard';
+  const questionCount = Math.max(2, Math.min(6, Number(input.count) || 4));
+  const focus = text(input.focus, 300);
+  const experimentCode = text(input.experimentCode, 20);
+  const experimentTitle = text(input.experimentTitle, 160);
+  const curriculum = text(input.curriculum, 300);
+  const skills = Array.isArray(input.skills)
+    ? input.skills.filter((skill) => typeof skill === 'string').slice(0, 8).map((skill) => text(skill, 80))
+    : [];
+
+  const moduleContext = experimentCode
+    ? `The students will carry out this virtual practical: ${experimentCode} — ${experimentTitle}.
+Curriculum link: ${curriculum || 'WAEC senior secondary practical syllabus'}.
+Skills practised: ${skills.join('; ') || 'practical measurement, data handling and inference'}.
+Write the challenge so it can be completed using that apparatus and those measurements.`
+    : 'Design a written challenge tied to the WAEC practical syllabus for this subject.';
+
+  const prompt = `Create one new WAEC-style practical challenge for a Nigerian senior secondary school class.
+
+Subject: ${subject}
+Class: ${gradeLevel}
+Difficulty: ${difficulty}
+${focus ? `Teacher focus: ${focus}\n` : ''}${moduleContext}
+
+Ground every task in the WAEC/NECO practical curriculum. Use British English, SI units and the conventions of a Nigerian practical paper (readings, precautions, calculation, sources of error). The written questions must be answerable from the practical and its theory; do not invent apparatus the simulation does not have. Do not repeat an existing textbook question verbatim.
+
+Return JSON only, with exactly this shape:
+{
+  "title": "short challenge title",
+  "waecReference": "topic and paper reference, e.g. SS2 mechanics — WAEC practical paper 3",
+  "objective": "what the student will determine or demonstrate",
+  "instructions": "3–5 sentences telling the student what to do on the bench and what to submit",
+  "questions": [
+    { "prompt": "question text", "marks": 2, "markingGuide": "what earns full marks" }
+  ],
+  "markingGuide": "general examiner guidance for the whole challenge"
+}
+
+Rules: give exactly ${questionCount} questions; each question is worth 2–6 marks; the markingGuide must be specific enough for a teacher to award partial credit; no markdown, no code fences, no extra keys.`;
+
+  let response = null;
+  let model = '';
+  let lastStatus = 0;
+  for (const candidate of aiModels()) {
+    let attempt = null;
+    try {
+      attempt = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidate)}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.9,
+              responseMimeType: 'application/json',
+              maxOutputTokens: 2048,
+            },
+          }),
+          signal: AbortSignal.timeout(30000),
+        },
+      );
+    } catch (error) {
+      console.error(`Gemini request to ${candidate} failed:`, error.message);
+      continue;
+    }
+    if (attempt.ok) {
+      response = attempt;
+      model = candidate;
+      break;
+    }
+    lastStatus = attempt.status;
+    const detail = await attempt.text().catch(() => '');
+    console.error(`Gemini ${candidate} responded ${attempt.status}:`, detail.slice(0, 300));
+    // 404 (retired model), 429 and 503 (demand) are worth trying on the fallback.
+    if (![404, 429, 503].includes(attempt.status)) break;
+  }
+
+  if (!response) {
+    throw new HttpError(
+      lastStatus === 429 ? 429 : 503,
+      lastStatus === 429
+        ? 'The AI service is busy. Wait a moment and try again.'
+        : lastStatus === 404
+          ? 'The configured AI model is unavailable. Set GEMINI_MODEL to a current model.'
+          : 'The AI service could not complete the request. Check GEMINI_API_KEY and try again.',
+    );
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new HttpError(502, 'The AI returned an unreadable response. Try again.');
+  }
+  const raw =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((part) => part?.text ?? '')
+      .join('') ?? '';
+  let payload;
+  try {
+    payload = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, '').trim());
+  } catch {
+    throw new HttpError(502, 'The AI returned an unreadable challenge. Try again.');
+  }
+
+  return { challenge: coerceChallenge(payload, questionCount), model };
 }
 
 function allowCorsOrigin(origin, allowedOrigins, allowCredentials) {
@@ -900,6 +1130,67 @@ async function handle(db, req, res, options = {}) {
     return;
   }
 
+  if (method === 'POST' && path === '/api/assignments') {
+    requireActor(actor);
+    assertRole(actor, ['TEACHER']);
+    const body = await readBody(req);
+    const title = required(body.title, 'Test title', 160);
+    const experimentCode = required(body.experimentCode, 'Practical', 20).toUpperCase();
+    if (!/^[A-Z0-9-]{3,20}$/.test(experimentCode)) {
+      throw new HttpError(400, 'Choose a valid practical for this test.');
+    }
+    const classCode = text(body.classCode, 40).toUpperCase() || actor.classCode;
+    if (classCode !== actor.classCode) {
+      throw new HttpError(403, 'You can only set tests for your own class.');
+    }
+    const source = text(body.source, 10).toUpperCase() === 'AI' ? 'AI' : 'TEACHER';
+    const id = makeId('test');
+    db.prepare(
+      `INSERT INTO assignments (id, teacher_id, school_id, class_code, title, experiment_code,
+         instructions, due_at, params_json, questions_json, marking_guide, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      actor.id,
+      actor.schoolId,
+      classCode,
+      title,
+      experimentCode,
+      text(body.instructions, 2000),
+      text(body.dueAt, 40) || null,
+      JSON.stringify(numberMap(body.params)),
+      JSON.stringify(cleanQuestions(body.questions)),
+      text(body.markingGuide, 4000),
+      source,
+      now(),
+    );
+    const created = db.prepare(`${ASSIGNMENT_SELECT} WHERE asg.id = ?`).get(id);
+    sendJson(res, 201, { assignment: mapAssignment(created) });
+    return;
+  }
+
+  const assignmentMatch = path.match(/^\/api\/assignments\/([^/]+)$/);
+  if (method === 'DELETE' && assignmentMatch) {
+    requireActor(actor);
+    const assignment = db.prepare('SELECT * FROM assignments WHERE id = ?').get(assignmentMatch[1]);
+    if (!assignment) throw new HttpError(404, 'Test not found.');
+    if (actor.role !== 'ADMIN' && assignment.teacher_id !== actor.id) {
+      throw new HttpError(403, 'You can only remove tests you set.');
+    }
+    db.prepare('DELETE FROM assignments WHERE id = ?').run(assignment.id);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/ai/challenge') {
+    requireActor(actor);
+    assertRole(actor, ['TEACHER', 'ADMIN']);
+    const body = await readBody(req);
+    const result = await generateAiChallenge(body);
+    sendJson(res, 200, result);
+    return;
+  }
+
   const attemptSubmitMatch = path.match(/^\/api\/attempts\/([^/]+)\/submit$/);
   if (method === 'POST' && attemptSubmitMatch) {
     requireActor(actor);
@@ -920,6 +1211,19 @@ async function handle(db, req, res, options = {}) {
     const notes = text(body.notes, 2000);
     const scoreJson = body.score ? JSON.stringify(body.score) : null;
     const scenarioJson = body.scenarioSnapshot ? JSON.stringify(body.scenarioSnapshot) : null;
+    const paramsJson = JSON.stringify(numberMap(body.params));
+    const challengeJson = JSON.stringify(body.challenge ?? {});
+    const assignmentId = text(body.assignmentId, 60) || null;
+    if (assignmentId) {
+      const assignment = db.prepare('SELECT * FROM assignments WHERE id = ?').get(assignmentId);
+      if (
+        !assignment ||
+        assignment.school_id !== actor.schoolId ||
+        assignment.class_code !== actor.classCode
+      ) {
+        throw new HttpError(403, 'That test is not assigned to your class.');
+      }
+    }
     const submittedAt = text(body.submittedAt, 40) || now();
 
     if (existing) {
@@ -927,7 +1231,7 @@ async function handle(db, req, res, options = {}) {
         `UPDATE attempts
          SET status = 'SCORED', delivery = 'delivered', submitted_at = ?,
              rows_json = ?, answers_json = ?, graph_json = ?, flags_json = ?, notes = ?,
-             score_json = ?, scenario_json = ?
+             score_json = ?, scenario_json = ?, params_json = ?, assignment_id = ?, challenge_json = ?
          WHERE id = ?`,
       ).run(
         submittedAt,
@@ -938,13 +1242,17 @@ async function handle(db, req, res, options = {}) {
         notes,
         scoreJson,
         scenarioJson,
+        paramsJson,
+        assignmentId,
+        challengeJson,
         attemptId,
       );
     } else {
       db.prepare(
         `INSERT INTO attempts (id, student_id, experiment_code, seed, status, delivery, config_version, idempotency_key,
-           started_at, submitted_at, rows_json, answers_json, graph_json, flags_json, notes, score_json, scenario_json)
-         VALUES (?, ?, ?, ?, 'SCORED', 'delivered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           started_at, submitted_at, rows_json, answers_json, graph_json, flags_json, notes, score_json, scenario_json,
+           params_json, assignment_id, challenge_json)
+         VALUES (?, ?, ?, ?, 'SCORED', 'delivered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         attemptId,
         actor.id,
@@ -961,6 +1269,9 @@ async function handle(db, req, res, options = {}) {
         notes,
         scoreJson,
         scenarioJson,
+        paramsJson,
+        assignmentId,
+        challengeJson,
       );
     }
 
@@ -990,18 +1301,42 @@ async function handle(db, req, res, options = {}) {
     const graphJson = body.graph ? JSON.stringify(body.graph) : null;
     const flagsJson = JSON.stringify(body.flags ?? {});
     const notes = text(body.notes, 2000);
+    const paramsJson = JSON.stringify(numberMap(body.params));
+    const challengeJson = JSON.stringify(body.challenge ?? {});
+    const assignmentId = text(body.assignmentId, 60) || null;
+    if (assignmentId) {
+      const assignment = db.prepare('SELECT * FROM assignments WHERE id = ?').get(assignmentId);
+      if (
+        !assignment ||
+        assignment.school_id !== actor.schoolId ||
+        assignment.class_code !== actor.classCode
+      ) {
+        throw new HttpError(403, 'That test is not assigned to your class.');
+      }
+    }
 
     if (existing) {
       db.prepare(
         `UPDATE attempts
-         SET rows_json = ?, answers_json = ?, graph_json = ?, flags_json = ?, notes = ?
+         SET rows_json = ?, answers_json = ?, graph_json = ?, flags_json = ?, notes = ?,
+             params_json = ?, assignment_id = ?, challenge_json = ?
          WHERE id = ?`,
-      ).run(rowsJson, answersJson, graphJson, flagsJson, notes, attemptId);
+      ).run(
+        rowsJson,
+        answersJson,
+        graphJson,
+        flagsJson,
+        notes,
+        paramsJson,
+        assignmentId,
+        challengeJson,
+        attemptId,
+      );
     } else {
       db.prepare(
         `INSERT INTO attempts (id, student_id, experiment_code, seed, status, delivery, config_version, idempotency_key,
-           started_at, rows_json, answers_json, graph_json, flags_json, notes)
-         VALUES (?, ?, ?, ?, 'IN_PROGRESS', 'not-submitted', ?, ?, ?, ?, ?, ?, ?, ?)`,
+           started_at, rows_json, answers_json, graph_json, flags_json, notes, params_json, assignment_id, challenge_json)
+         VALUES (?, ?, ?, ?, 'IN_PROGRESS', 'not-submitted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         attemptId,
         actor.id,
@@ -1015,6 +1350,9 @@ async function handle(db, req, res, options = {}) {
         graphJson,
         flagsJson,
         notes,
+        paramsJson,
+        assignmentId,
+        challengeJson,
       );
     }
 

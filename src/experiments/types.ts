@@ -100,6 +100,20 @@ export interface CalculationSpec<S> {
   fromGradient?: boolean;
 }
 
+export interface ParameterSpec<S = any> {
+  id: string;
+  label: string;
+  unit?: string;
+  hint?: string;
+  min: number;
+  max: number;
+  step: number;
+  /** Current value of this parameter in a generated scenario. */
+  read: (scenario: S) => number;
+  /** Returns a new scenario with this parameter changed, keeping derived values consistent. */
+  apply: (scenario: S, value: number) => S;
+}
+
 export interface ExperimentDefinition<S = any> {
   meta: ExperimentMeta;
   scene: SceneKind;
@@ -110,6 +124,8 @@ export interface ExperimentDefinition<S = any> {
   calculations: CalculationSpec<S>[];
   /** Scenario parameters, generated from the attempt seed. */
   generate: (seed: number) => S;
+  /** Controls a student (or teacher) can use to vary the experiment by hand. */
+  parameters?: ParameterSpec<S>[];
   /** Authoritative marking. Runs in the scoring service only. */
   score: (attempt: AttemptData, scenario: S) => ScoreResult;
   /** Coach tip shown beside the apparatus. */

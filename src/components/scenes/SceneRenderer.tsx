@@ -6,16 +6,24 @@ import {
   ForcesScene,
   InclineScene,
   MomentsScene,
-  SpringScene,
 } from './MechanicsScenes';
 import { MeasureScene } from './MeasureScene';
 import { OpticsScene } from './OpticsScene';
 import { BridgeScene, CircuitScene } from './ElectricityScenes';
 import { CoolingScene, GasScene, ThermalScene } from './ThermalScenes';
-import { TitrationScene } from './TitrationScene';
-import { FoodScene, TubesScene } from './QualitativeScenes';
-
 const PendulumScene = lazy(() => import('./PendulumScene'));
+const SpringScene = lazy(() =>
+  import('./SpringScene').then((module) => ({ default: module.SpringScene })),
+);
+const TitrationScene = lazy(() =>
+  import('./TitrationScene').then((module) => ({ default: module.TitrationScene })),
+);
+const TubesScene = lazy(() =>
+  import('./QualitativeScenes').then((module) => ({ default: module.TubesScene })),
+);
+const FoodScene = lazy(() =>
+  import('./QualitativeScenes').then((module) => ({ default: module.FoodScene })),
+);
 
 function SceneLoading() {
   return (
@@ -28,16 +36,24 @@ function SceneLoading() {
   );
 }
 
+function LazyScene({ children }: { children: React.ReactNode }) {
+  return <Suspense fallback={<SceneLoading />}>{children}</Suspense>;
+}
+
 export function SceneRenderer(props: SceneProps) {
   switch (props.experiment.scene) {
     case 'pendulum':
       return (
-        <Suspense fallback={<SceneLoading />}>
+        <LazyScene>
           <PendulumScene {...props} />
-        </Suspense>
+        </LazyScene>
       );
     case 'spring':
-      return <SpringScene {...props} />;
+      return (
+        <LazyScene>
+          <SpringScene {...props} />
+        </LazyScene>
+      );
     case 'moments':
       return <MomentsScene {...props} />;
     case 'displacement':
@@ -61,11 +77,23 @@ export function SceneRenderer(props: SceneProps) {
     case 'gas':
       return <GasScene {...props} />;
     case 'titration':
-      return <TitrationScene {...props} />;
+      return (
+        <LazyScene>
+          <TitrationScene {...props} />
+        </LazyScene>
+      );
     case 'tubes':
-      return <TubesScene {...props} />;
+      return (
+        <LazyScene>
+          <TubesScene {...props} />
+        </LazyScene>
+      );
     case 'food':
-      return <FoodScene {...props} />;
+      return (
+        <LazyScene>
+          <FoodScene {...props} />
+        </LazyScene>
+      );
     default:
       return null;
   }

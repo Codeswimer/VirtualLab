@@ -1,5 +1,5 @@
 import type { AttemptData, ScoreResult } from '@sim/scoring/types';
-import { getExperimentByCode } from '@/experiments';
+import { getExperimentByCode, scenarioFor } from '@/experiments';
 import type { StoredAttempt } from '@/stores/app-store';
 
 /**
@@ -21,7 +21,7 @@ export async function markAttempt(
   if (!experiment) {
     throw new Error(`Unknown experiment ${attempt.experimentCode}`);
   }
-  const scenario = experiment.generate(attempt.seed);
+  const scenario = scenarioFor(experiment, attempt.seed, attempt.params);
   const payload: AttemptData = {
     experimentCode: attempt.experimentCode,
     seed: attempt.seed,
